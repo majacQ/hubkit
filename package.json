@@ -1,11 +1,13 @@
 {
   "name": "hubkit",
-  "version": "2.1.5",
+  "version": "5.4.0",
   "description": "GitHub API library for JavaScript, promise-based, for both NodeJS and the browser",
   "main": "index.js",
+  "types": "index.d.ts",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "release": "release-it"
+    "release": "release-it",
+    "update": "yarn upgrade-interactive --latest"
   },
   "repository": {
     "type": "git",
@@ -23,14 +25,15 @@
   },
   "homepage": "https://github.com/pkaminski/hubkit",
   "engines": {
-    "node": ">=6.0"
+    "node": ">=14.0"
   },
   "dependencies": {
-    "axios": "0.21",
+    "axios": "^1.2.1",
     "lru-cache": "6.x"
   },
   "devDependencies": {
-    "eslint": "7.x",
-    "release-it": "14.x"
+    "eslint": "^8.57.0",
+    "release-it": "15.3.0",
+    "reviewable-configs": "Reviewable/reviewable-configs"
   }
 }
