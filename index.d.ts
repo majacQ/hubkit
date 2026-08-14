@@ -1,3 +1,5 @@
+import type {LRUCache} from 'lru-cache';
+
 export default class Hubkit {
   static defaults: Options & {stats: Stats};
   static Stats: StatsClass;
@@ -27,15 +29,17 @@ interface Options {
   immutable?: boolean;
   fresh?: boolean;
   stale?: boolean;
-  responseType?: string;
+  responseType?: 'text' | 'arraybuffer' | 'blob';
   maxTries?: number;
   timeout?: number;
   maxItemSizeRatio?: number;
   metadata?: Metadata;
   stats?: Stats;
-  agent?: any;
-  corsSuccessFlags?: Record<string, boolean>;
-  cache?: any;
+  cache?: LRUCache<
+    string,
+    {promise: Promise<any>, size: number} |
+    {value: any, eTag?: string, status: number, headers: any, size: number, expiry?: number}
+  > | null;
   userAgent?: string;
   autoQueryRateLimit?: boolean;
 
@@ -59,7 +63,7 @@ interface Options {
     response?: any,
     logTag?: string,
     fingerprint?: string[],
-    timeout?: boolean,
+    networkFailure?: boolean,
   }):
     undefined | typeof Hubkit.RETRY | typeof Hubkit.DONT_RETRY | any;
 }
@@ -75,7 +79,7 @@ interface Stats {
   hitSizeRate: number;
 }
 
-interface Metadata {
+export interface Metadata {
   rateLimit?: number;
   rateLimitRemaining?: number;
   searchRateLimit?: number;
@@ -83,4 +87,5 @@ interface Metadata {
   graphRateLimit?: number;
   graphRateLimitRemaining?: number;
   oAuthScopes?: string[];
+  contentType?: string;
 }

@@ -1,18 +1,16 @@
 {
   "name": "hubkit",
-  "version": "5.7.3",
+  "version": "8.0.0",
   "description": "GitHub API library for JavaScript, promise-based, for both NodeJS and the browser",
   "main": "index.js",
   "types": "index.d.ts",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "release": "release-it",
-    "update": "yarn upgrade-interactive --latest"
+    "lint": "eslint *.js",
+    "update": "yarn up -R '*' && yarn dedupe --strategy highest",
+    "latest": "yarn npm-check-updates -i -m --packageManager yarn --install never && yarn install",
+    "upgrade": "reviewable-upgrade"
   },
-  "repository": {
-    "type": "git",
-    "url": "git://github.com/pkaminski/hubkit.git"
-  },
+  "repository": "https://github.com/Reviewable/hubkit",
   "keywords": [
     "github",
     "api",
@@ -25,16 +23,15 @@
   },
   "homepage": "https://github.com/pkaminski/hubkit",
   "engines": {
-    "node": ">=14.0"
+    "node": ">=18.0"
   },
-  "packageManager": "yarn@1.22.22",
+  "packageManager": "yarn@4.13.0",
   "dependencies": {
-    "axios": "^1.2.1",
-    "lru-cache": "6.x"
+    "lru-cache": "11.x"
   },
   "devDependencies": {
-    "eslint": "^8.57.0",
-    "release-it": "15.3.0",
-    "reviewable-configs": "Reviewable/reviewable-configs"
+    "eslint": "^10.7.0",
+    "npm-check-updates": "^22.2.9",
+    "reviewable-configs": "Reviewable/reviewable-configs#master"
   }
 }

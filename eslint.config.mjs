@@ -6,10 +6,15 @@ export default [
     files: ['*.js'],
     languageOptions: {
       globals: {
-        LRUCache: true,
-        axios: true,
+        lrucache: true,
+        AbortController: false,
+        btoa: false,
+        clearTimeout: false,
+        DOMException: false,
+        fetch: false,
         Promise: false,
-        setTimeout: false
+        setTimeout: false,
+        URL: false
       },
       sourceType: 'script'
     }

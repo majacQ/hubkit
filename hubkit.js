@@ -1,7 +1,6 @@
 if (typeof require !== 'undefined') {
   /* global require */
-  if (typeof axios === 'undefined') axios = require('axios');
-  if (typeof LRUCache === 'undefined') LRUCache = require('lru-cache');
+  if (typeof lrucache === 'undefined') lrucache = require('lru-cache');
 }
 
 (function() {
@@ -10,10 +9,8 @@ if (typeof require !== 'undefined') {
   /* global process */
   const isNode = typeof process !== 'undefined' && process.versions && process.versions.node;
 
-  const NETWORK_ERROR_CODES = [
-    'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EADDRINFO', 'ESOCKETTIMEDOUT', 'ECONNABORTED',
-    'ERR_NETWORK'
-  ];
+  // Carries a paginated response's pager factory so `next` can be rebuilt for each caller.
+  const NEXT_FACTORY = Symbol('hubkit.nextFactory');
 
   class Directive {
     constructor(arg, body, options, hubkit) {
@@ -128,8 +125,8 @@ if (typeof require !== 'undefined') {
 
     static defaults = {
       method: 'GET', host: 'https://api.github.com', perPage: 100, allPages: true, maxTries: 3,
-      maxItemSizeRatio: 0.1, metadata: Hubkit, stats: new Hubkit.Stats(), agent: false,
-      corsSuccessFlags: {}, gheVersion: undefined, scopes: undefined, apiVersion: undefined
+      maxItemSizeRatio: 0.1, metadata: Hubkit, stats: new Hubkit.Stats(),
+      gheVersion: undefined, scopes: undefined, apiVersion: undefined
     };
 
     static RETRY = {};  // marker object
@@ -147,7 +144,8 @@ if (typeof require !== 'undefined') {
       if (options.onRequest) await options.onRequest(options);
       path = interpolatePath(path, options);
 
-      let cachedItem = null, cacheKey, cacheable = options.cache && options.method === 'GET';
+      let cachedItem = null, cacheKey;
+      const cacheable = options.cache && options.method === 'GET';
       if (cacheable) {
         // Pin cached value, in case it gets evicted during the request
         cacheKey = computeCacheKey(path, options);
@@ -168,7 +166,9 @@ if (typeof require !== 'undefined') {
               options.stats.record(true, cachedItem.size);
             }
           }
-          return cachedItem.promise || Promise.resolve(cachedItem.value);
+          return cachedItem.promise ?
+            cachedItem.promise.then(value => attachFreshNext(value, this, options)) :
+            Promise.resolve(attachFreshNext(cachedItem.value, this, options));
         }
       }
 
@@ -177,46 +177,34 @@ if (typeof require !== 'undefined') {
         send(options.body, options._cause || 'initial');
 
         function handleError(error, res) {
-          error.request = {method: options.method, url: path, headers: res && res.headers};
-          if (error.request.headers) delete error.request.headers.authorization;
-          if (cacheable && res && res.status) {
-            options.cache.del(cacheKey);
+          const headers = res && Object.fromEntries(
+            [...res.headers].filter(([k]) => k !== 'authorization'));
+          error.request = {method: options.method, url: path, headers};
+          if (cacheable && res) {
+            options.cache.delete(cacheKey);
             if (options.stats) options.stats.record(false);
-          }
-          // If the request failed due to CORS, it may be because it was both preflighted and
-          // redirected.  Attempt to recover by reissuing it as a simple request without
-          // preflight, which requires getting rid of all extraneous headers.
-          if (cacheable && /Network Error/.test(error.originalMessage)) {
-            cacheable = false;
-            retry();
-            return;
           }
           let value;
           if (options.onError) value = options.onError(error);
           if (value === undefined) {
-            if (NETWORK_ERROR_CODES.indexOf(error.code) >= 0 ||
-              [500, 502, 503, 504].indexOf(res && res.status) >= 0 ||
-              error.originalMessage === 'socket hang up' ||
-              error.originalMessage === 'Unexpected end of input'
-            ) {
+            if (error.networkFailure || [500, 502, 503, 504].includes(res?.status)) {
               value = Hubkit.RETRY;
-              options.agent = false;
-            } else if (res && res.status === 403 && res.headers['retry-after']) {
+            } else if (res?.status === 403 && res.headers.get('retry-after')) {
               try {
                 error.retryDelay =
-                  parseInt(res.headers['retry-after'].replace(/[^\d]*$/, ''), 10) * 1000;
+                  parseInt(res.headers.get('retry-after').replace(/[^\d]*$/, ''), 10) * 1000;
                 if (!options.timeout || error.retryDelay < options.timeout) value = Hubkit.RETRY;
-              } catch (e) {
+              } catch {
                 // ignore, don't retry request
               }
-            } else if (res && res.status === 403 &&
-                res.headers['x-ratelimit-remaining'] === '0' &&
-                res.headers['x-ratelimit-reset']) {
+            } else if (res?.status === 403 &&
+                res.headers.get('x-ratelimit-remaining') === '0' &&
+                res.headers.get('x-ratelimit-reset')) {
               try {
-                error.retryDelay =
-                  Math.max(0, parseInt(res.headers['x-ratelimit-reset'], 10) * 1000 - Date.now());
+                const reset = parseInt(res.headers.get('x-ratelimit-reset'), 10);
+                error.retryDelay = Math.max(0, reset * 1000 - Date.now());
                 if (!options.timeout || error.retryDelay < options.timeout) value = Hubkit.RETRY;
-              } catch (e) {
+              } catch {
                 // ignore, don't retry request
               }
             }
@@ -247,9 +235,6 @@ if (typeof require !== 'undefined') {
 
         const onComplete = (res, rawData) => {
           extractMetadata(path, res.headers, options.metadata);
-          if (res.headers['access-control-allow-origin']) {
-            options.corsSuccessFlags[options.host] = true;
-          }
 
           try {
             if (res.status === 304) {
@@ -260,7 +245,7 @@ if (typeof require !== 'undefined') {
               extractMetadata(path, res.headers, options.metadata);
               cachedItem.expiry = parseExpiry(res.headers);
               if (options.stats) options.stats.record(true, cachedItem.size);
-              resolve(cachedItem.value);
+              resolve(attachFreshNext(cachedItem.value, this, options));
             } else if (
               !(res.status >= 200 && res.status < 300 ||
                 options.boolean && res.status === 404 && res.data &&
@@ -268,7 +253,7 @@ if (typeof require !== 'undefined') {
               ) || res.data && res.data.errors
             ) {
               if (cacheable) {
-                options.cache.del(cacheKey);
+                options.cache.delete(cacheKey);
                 if (options.stats) options.stats.record(false);
               }
               let status = res.status;
@@ -317,14 +302,14 @@ if (typeof require !== 'undefined') {
                 }
                 statusError.path = path;  // This is the fully expanded URL at this point.
                 statusError.pathPattern = options.pathPattern;
-                statusError.response = res;
+                statusError.response = {...res, headers: Object.fromEntries(res.headers)};
                 if (options.logTag) statusError.logTag = options.logTag;
                 statusError.fingerprint =
                   ['Hubkit', options.method, options.logTag || options.pathPattern, `${status}`];
                 handleError(statusError, res);
               }
             } else if (options.media === 'raw' && !(
-              /^(?:text\/plain|application\/octet-stream) *;?/.test(res.headers['content-type'])
+              /^(?:text\/plain|application\/octet-stream) *;?/.test(res.headers.get('content-type'))
             )) {
               // retry if github disregards 'raw'
               handleError(new Error(
@@ -332,16 +317,12 @@ if (typeof require !== 'undefined') {
               ), res);
             } else {
               let nextUrl;
-              if (res.headers.link) {
-                const match = /<([^>]+?)>;\s*rel="next"/.exec(res.headers.link);
+              if (res.headers.get('link')) {
+                const match = /<([^>]+?)>;\s*rel="next"/.exec(res.headers.get('link'));
                 nextUrl = match && match[1];
                 if (nextUrl && !(options.method === 'GET' || options.method === 'HEAD')) {
                   throw new Error(formatError('Hubkit', 'paginated response for non-GET method'));
                 }
-              }
-              if (!res.data && rawData &&
-                  /\bformat=json\b/.test(res.headers['x-github-media-type'])) {
-                res.data = JSON.parse(rawData);
               }
               if (detectApi(path) === 'graph') {
                 let root = res.data.data;
@@ -402,18 +383,18 @@ if (typeof require !== 'undefined') {
                       send(options.body, 'page');
                       return;  // Don't resolve yet, more pages to come
                     }
-                    result.next = () => {
-                      return this.request(
-                        path,
-                        defaults({
-                          _cause: 'page', body: defaults({
-                            variables: defaults({
-                              after: cursor
-                            }, options.body.variables)
-                          }, options.body)
-                        }, options)
-                      );
-                    };
+                    const makeNext = (self, opts) => () => self.request(
+                      path,
+                      defaults({
+                        _cause: 'page', body: defaults({
+                          variables: defaults({
+                            after: cursor
+                          }, opts.body.variables)
+                        }, opts.body)
+                      }, opts)
+                    );
+                    result.next = makeNext(this, options);
+                    result[NEXT_FACTORY] = makeNext;
                   }
                 } else {
                   result = res.data.data;
@@ -445,9 +426,10 @@ if (typeof require !== 'undefined') {
                     send(null, 'page');
                     return;  // Don't resolve yet, more pages to come.
                   }
-                  result.next = () => {
-                    return this.request(nextUrl, defaults({_cause: 'page', body: null}, options));
-                  };
+                  const makeNext = (self, opts) =>
+                    () => self.request(nextUrl, defaults({_cause: 'page', body: null}, opts));
+                  result.next = makeNext(this, options);
+                  result[NEXT_FACTORY] = makeNext;
                 }
               } else {
                 if (nextUrl || result) {
@@ -467,17 +449,20 @@ if (typeof require !== 'undefined') {
                 }
               }
               if (cacheable) {
-                const size = rawData ? rawData.length : (res.data ?
-                  (res.data.size || res.data.byteLength) : 1);
+                const size =
+                  rawData ? rawData.length || rawData.size || rawData.byteLength :
+                  res.data ? res.data.size || res.data.byteLength :
+                  1;
                 if (options.stats) options.stats.record(false, size);
-                if (res.status === 200 && (res.headers.etag || res.headers['cache-control']) &&
-                    size <= options.cache.max * options.maxItemSizeRatio) {
+                if (res.status === 200 &&
+                    (res.headers.get('etag') || res.headers.get('cache-control')) &&
+                    size <= options.cache.maxSize * options.maxItemSizeRatio) {
                   options.cache.set(cacheKey, {
-                    value: result, eTag: res.headers.etag, status: res.status, headers: res.headers,
-                    size, expiry: parseExpiry(res.headers)
+                    value: result, eTag: res.headers.get('etag'), status: res.status,
+                    headers: res.headers, size, expiry: parseExpiry(res.headers)
                   });
                 } else {
-                  options.cache.del(cacheKey);
+                  options.cache.delete(cacheKey);
                 }
               }
               resolve(result);
@@ -488,20 +473,14 @@ if (typeof require !== 'undefined') {
         };
 
         function onError(error) {
-          // If we get an error response without a status, then it's not a real error coming back
-          // from the server but some kind of synthetic response Axios concocted for us.  Treat it
-          // as a generic network error.
-          if (error.response && error.response.status) return onComplete(error.response);
-
-          if ((/Network Error/.test(error.message) || error.message === '0') &&
-              (options.corsSuccessFlags[options.host] ||
-                !cacheable && (options.method === 'GET' || options.method === 'HEAD'))
-          ) {
-            error.message = 'Request terminated abnormally, network may be offline';
-          }
-          if (error.message === 'maxContentLength size of -1 exceeded') error.message = 'aborted';
           error.originalMessage = error.message;
-          error.message = formatError('Hubkit', error.message);
+          const message = formatError('Hubkit', error.message);
+          try {
+            error.message = message;
+          } catch {
+            // DOMException (e.g. TimeoutError) has a read-only 'message' property.
+            Object.defineProperty(error, 'message', {value: message, writable: true});
+          }
           error.fingerprint =
             ['Hubkit', options.method, options.pathPattern, error.originalMessage];
           handleError(error);
@@ -515,18 +494,9 @@ if (typeof require !== 'undefined') {
             const config = {
               url: path,
               method: options.method,
-              timeout: timeout || 0,
+              timeout,
               params: {},
-              headers: {},
-              transformResponse: [data => {
-                rawData = data;
-                // avoid axios default transform for 'raw'
-                // https://github.com/axios/axios/issues/907
-                if (options.media !== 'raw') {
-                  return axios.defaults.transformResponse[0](data);
-                }
-                return data;
-              }]
+              headers: {}
             };
             addHeaders(config, options, cachedItem);
 
@@ -538,11 +508,12 @@ if (typeof require !== 'undefined') {
 
             if (body) {
               if (options.method === 'GET') config.params = Object.assign(config.params, body);
-              else config.data = body;
+              else config.body = body;
             }
             let received = false;
             try {
-              const res = await axios(config);
+              const res = await fetchResponse(config, options);
+              rawData = res.rawData;
               received = true;
               const api = detectApi(path);
               const cost = api === 'graph' ? res.data?.data?.rateLimit?.cost : 1;
@@ -605,9 +576,9 @@ if (typeof require !== 'undefined') {
     return total ? hits / total : 0;
   }
 
-  if (typeof LRUCache !== 'undefined') {
+  if (typeof lrucache !== 'undefined') {
     Hubkit.defaults.cache =
-      new LRUCache({max: 10000000, length: item => item.size});
+      new lrucache.LRUCache({maxSize: 10000000, sizeCalculation: item => item.size});
   }
 
   async function replaceAsync(str, regex, replacerFn) {
@@ -646,7 +617,7 @@ if (typeof require !== 'undefined') {
       path = a[1];
     }
     options.method = options.method.toUpperCase();
-    options.pathPattern = path;
+    options.pathPattern ??= path;
     path = interpolate(path, options);
     if (!/^http/.test(path)) path = options.host + path;
     return path;
@@ -673,25 +644,19 @@ if (typeof require !== 'undefined') {
   function addHeaders(config, options, cachedItem) {
     /* eslint-disable dot-notation */
     if (cachedItem && cachedItem.eTag) config.headers['If-None-Match'] = cachedItem.eTag;
-    if (isNode && options.agent) {
-      config[/^https:/.test(options.host) ? 'httpsAgent' : 'httpAgent'] = options.agent;
-    }
     if (options.token) {
       config.headers['Authorization'] = `token ${options.token}`;
     } else if (options.username && options.password) {
       throw new Error('Username / password authentication is no longer supported');
     } else if (options.clientId && options.clientSecret) {
-      config.auth = {
-        username: options.clientId,
-        password: options.clientSecret
-      };
+      config.headers['Authorization'] =
+        `Basic ${btoa(`${options.clientId}:${options.clientSecret}`)}`;
     }
     if (options.userAgent) config.headers['User-Agent'] = options.userAgent;
     if (options.media) config.headers['Accept'] = `application/vnd.github.${options.media}`;
     if (options.method === 'GET' || options.method === 'HEAD') {
       config.params['per_page'] = options.perPage;
     }
-    if (!isNode && options.responseType) config.responseType = options.responseType;
     // We can't use Cache-Control because it's not
     // allowed by Github's cross-domain request headers
     if (!isNode && (options.method === 'GET' || options.method === 'HEAD')) {
@@ -703,19 +668,71 @@ if (typeof require !== 'undefined') {
     /* eslint-enable dot-notation */
   }
 
+  async function fetchResponse(config, options) {
+    const init = {method: config.method, headers: config.headers};
+    if (config.body) {
+      init.body = JSON.stringify(config.body);
+      init.headers['Content-Type'] = 'application/json';
+    }
+    const url = new URL(config.url);
+    for (const key in config.params) url.searchParams.set(key, config.params[key]);
+    let timeoutId;
+    if (config.timeout) {
+      // TODO: Switch to AbortSignal.timeout once widely supported.
+      const controller = new AbortController();
+      init.signal = controller.signal;
+      timeoutId = setTimeout(() => {
+        controller.abort(
+          new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+      }, config.timeout);
+    }
+    let response, rawData;
+    try {
+      response = await fetch(url, init);
+      rawData = await readResponseBody(response, options);
+    } catch (error) {
+      error.networkFailure = true;
+      throw error;
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+    }
+    return {
+      status: response.status,
+      headers: response.headers,
+      data: parseResponseData(rawData, response.headers, options),
+      rawData
+    };
+  }
+
+  function readResponseBody(response, options) {
+    switch (options.responseType) {
+      case 'arraybuffer': return response.arrayBuffer();
+      case 'blob': return response.blob();
+      default: return response.text();
+    }
+  }
+
+  function parseResponseData(rawData, headers, options) {
+    if (options.media === 'raw' || options.responseType) return rawData;
+    if (!rawData) return '';
+    const contentType = headers.get('content-type') || '';
+    if (/^application\/(?:[^\s;]+\+)?json\s*(?:;|$)/i.test(contentType)) return JSON.parse(rawData);
+    return rawData;
+  }
+
   function extractMetadata(path, headers, metadata) {
     if (!(headers && metadata)) return;
     const api = detectApi(path);
     const rateName = api === 'core' ? 'rateLimit' : `${api}RateLimit`;
-    metadata[rateName] = headers['x-ratelimit-limit'] &&
-      parseInt(headers['x-ratelimit-limit'], 10);
-    metadata[`${rateName}Remaining`] = headers['x-ratelimit-remaining'] &&
-      parseInt(headers['x-ratelimit-remaining'], 10);
+    metadata[rateName] = headers.get('x-ratelimit-limit') &&
+      parseInt(headers.get('x-ratelimit-limit'), 10);
+    metadata[`${rateName}Remaining`] = headers.get('x-ratelimit-remaining') &&
+      parseInt(headers.get('x-ratelimit-remaining'), 10);
     // Not every response includes an X-OAuth-Scopes header, so keep the last known set if
     // missing.
-    if ('x-oauth-scopes' in headers) {
+    if (headers.has('x-oauth-scopes')) {
       metadata.oAuthScopes = [];
-      const scopes = (headers['x-oauth-scopes'] || '').split(/\s*,\s*/);
+      const scopes = (headers.get('x-oauth-scopes') || '').split(/\s*,\s*/);
       if (!(scopes.length === 1 && scopes[0] === '')) {
         // GitHub will sometimes return duplicate scopes in the list, so uniquefy them.
         scopes.sort();
@@ -725,10 +742,11 @@ if (typeof require !== 'undefined') {
         }
       }
     }
+    if (headers.has('content-type')) metadata.contentType = headers.get('content-type');
   }
 
   function parseExpiry(headers) {
-    const match = (headers['cache-control'] || '').match(/(^|[,\s])max-age=(\d+)/);
+    const match = (headers.get('cache-control') || '').match(/(^|[,\s])max-age=(\d+)/);
     if (match) return Date.now() + 1000 * parseInt(match[2], 10);
   }
 
@@ -756,6 +774,24 @@ if (typeof require !== 'undefined') {
 
   function checkCache(options, cacheKey) {
     return options.cache.get(cacheKey);
+  }
+
+  // Return a shared response with its `next` pager rebound to the current request, so follow-up
+  // pages run in the caller's context (auth token, task lease, etc.) rather than the possibly
+  // stale context captured when the response was first fetched.  This covers every way a response
+  // gets handed out more than once: a settled cache hit, a 304 revalidation, and a concurrent
+  // caller awaiting an in-flight request.  The value is shallow-cloned so those callers don't
+  // clobber each other's `next`.
+  function attachFreshNext(value, self, options) {
+    const makeNext = value && value[NEXT_FACTORY];
+    if (!makeNext) return value;
+    const clone = Array.isArray(value) ? value.slice() : {...value};
+    // Carry the factory onto the clone as well, since a clone can itself be served again: it's
+    // what an in-flight request resolves with, and concurrent callers awaiting that same request
+    // need to rebind off it.  (Array slicing drops symbol-keyed properties.)
+    clone[NEXT_FACTORY] = makeNext;
+    clone.next = makeNext(self, options);
+    return clone;
   }
 
   function satisfiesGheVersion(options, minVersion) {
@@ -786,10 +822,7 @@ if (typeof require !== 'undefined') {
     return fieldsPromise;
   }
 
-  if (typeof angular !== 'undefined') {
-    /* global angular */
-    angular.module('hubkit', []).constant('Hubkit', Hubkit);
-  } else if (isNode) {
+  if (isNode) {
     /* global module */
     module.exports = Hubkit;
   } else if (typeof self === 'undefined') {
